@@ -14,7 +14,8 @@ This notebook provides a detailed guide for processing 10-meter resolution Digit
 
 Clip and process DEM data for HUC8 regions in WA. Calculate terrain attributes including slope, roughness, TWI, and curvature. Automate the processing of all HUC8 watersheds in the state.
 
-## Load packages
+
+## Running Code
 
 ```{r}
 library(terra)
@@ -30,8 +31,9 @@ library(elevatr)
 library(nhdplusTools)
 library(MultiscaleDTM)
 library(whitebox)
-```
 
+#terraOptions(chunksize = 1e6, memfrac = 0.9)  # Adjust memory fraction and chunk size
+```
 ## Load Preprocessed data - primarily utility functions
 
 ```{r}
@@ -40,13 +42,12 @@ load('./fun.RData')
 
 ## Load and Prepare Shapefiles
 
-wa_shapes: Washington state boundary shapes. wa_huc8s: Hydrological Unit Code 8 (HUC8) watershed boundaries.
-
 ```{r}
 wa_shapes <- vect("data/wa_shp_diss.gpkg")
 wa_huc8s <- vect("data/Hydrography/WA_HUC8.gpkg")
 wa_huc8s$name
 ```
+
 
 ## Data Processing Workflow
 
@@ -70,7 +71,7 @@ huc8_regions <- get_huc(AOI = wa_boundary, type = "huc08")
 Ajust as needed
 
 ```{r}
-datapath <- paste0(getwd(), "/data/WA_10m")
+datapath <- paste0(getwd(), "/data/WA_10m_R1")
 ```
 
 ## Define DEM Download Function - clip, calculate and save
@@ -82,6 +83,21 @@ Key tasks:
 -DEM Cropping and Masking: Crops DEM to the watershed boundary. -Terrain Metric Calculations: Slope, roughness, curvature, TWI. -WhiteboxTools Integration: Filling depressions, flow accumulation. -Saving Outputs: Exports combined rasters as GeoTIFF files.
 
 ```{r}
+calculate_tpi <- function(dem, scale) {
+  # Create a circular matrix for the specified scale
+  matrix_radius <- focalMat(dem, d = scale, type = "circle")
+  
+  # Calculate mean elevation within the defined scale
+  mean_elevation <- focal(dem, w = matrix_radius, fun = mean, na.rm = TRUE)
+  
+  # Calculate TPI as the difference between cell elevation and mean neighborhood elevation
+  tpi <- dem - mean_elevation
+  return(tpi)
+}
+```
+
+```{r}
+
 
 dem <- rast("./data/WA_10mDEM_3740.tif")
 
@@ -104,65 +120,179 @@ download_huc8_dem_name <- function(huc8_boundary, huc8_id,huc8_name, zoom_level 
     # Step 2: Calculate slope in radians
     slope <- terrain(dem_cropped,  "slope", unit = "radians")
     roughness <- terrain(dem_cropped,  "roughness")
+    
+    # Calculate slope in degrees
+    #slope_degrees <- terrain(dem_cropped, v = "slope", unit = "degrees")
+
+    # Calculate slope in radians (useful for certain hydrological calculations, e.g., TWI)
+    slope_radians <- terrain(dem_cropped, v = "slope", unit = "radians")
+
+    writeRaster(slope_radians, "./working_slope.tif",  gdal=c("COMPRESS=LZW"),overwrite=TRUE)
+   
     tpi <- terrain(dem_cropped,  "TPI")
     vrm <- VRM(dem_cropped, w = c(3, 3))
+  
     # Calculate the specific catchment area (SCA)
-    flowdir <- terrain(dem_cropped, "flowdir")
-    weight<- cellSize(dem_cropped,transform=FALSE,unit="m")
+    #flowdir <- terrain(dem_cropped, "flowdir")
+    #weight<- cellSize(dem_cropped,transform=FALSE,unit="m")
 
     #The algorithm is an adaptation of the one proposed by Zhou at al, 2019.
     # Calculate flow accumulation (which is equivalent to Specific Catchment Area)
-    flow_accumulation <- flowdir * weight
+    #flow_accumulation <- flowdir * weight
+    
     file_name ='workingdem.tif'
     writeRaster(dem_cropped, file_name,  gdal=c("COMPRESS=LZW"),overwrite=TRUE)
     # Step 2: Fill depressions in the DEM using WhiteboxTools
     wbt_fill_depressions("./workingdem.tif", "./filled_dem.tif")
+    
+    filledeelevation <- rast("./filled_dem.tif")
 
-    wbt_slope("./filled_dem.tif",  "./working_slope.tif", 
-  zfactor = 1.0,  # Adjust if the DEM is in geographic coordinates
-  units = "degrees"  # You can also specify "radians" if needed
-)
- 
     # Step 3: Calculate D8 flow accumulation
     wbt_d8_flow_accumulation("./filled_dem.tif", "./flow_accumulation.tif", out_type = "cells")
- slp <- rast("./working_slope.tif")
-   # Load the flow accumulation (SCA) raster
-   sca <- rast("./flow_accumulation.tif")
-
-
-
+    wbt_d_inf_flow_accumulation("./filled_dem.tif", "./flow_accumulationdinf.tif")
+    
+    cat("d8 and Inf flow  ",  "\n")
+    
+    slp <- rast("./working_slope.tif")
+    # Load the flow accumulation (SCA) raster
+    sca <- rast("./flow_accumulation.tif")
+    slp <- rast("./working_slope.tif")
     # Calculate TWI
     # Step 4: Calculate TWI using the SCA and slope
     twi <- log(sca / tan(slp))
-   
-    # Handle infinite values
-    twi[is.infinite(twi)] <- NA
+    twi[is.infinite(twi)] <-  NA
+    
+    cat("TWI  ",  "\n")
 
     # Calculate profile curvature with a specified window size
     # Calculate profile curvature with a specified window size
     profile_curv <- Qfit(dem_cropped, metrics = c("profc"), w = c(3, 3))
+    cat("Prof curv @3  ",  "\n")
+
+    # Calculate profile curvature with a specified window size
+    profile_curv9by9 <- Qfit(dem_cropped, metrics = c("profc"), w = c(9, 9))
+    cat("Prof curv @9  ",  "\n")
+    profile_curv17by17 <- Qfit(dem_cropped, metrics = c("profc"), w = c(17, 17))
+    cat("Prof curv @17  ",  "\n")
+   # profile_curv100by100 <- Qfit(dem_cropped, metrics = c("profc"), w = c(99, 99))
+    #cat("Prof curv @99 ",  "\n")
+    
     plan_curv <- Qfit(dem_cropped, metrics = c("planc"), w = c(3, 3))
     #plot(dem)
+    cat("Plan curv @3 ",  "\n")
+    plan_curv9by9 <- Qfit(dem_cropped, metrics = c("planc"), w = c(9, 9))
+     cat("Plan curv @3 ",  "\n")
+    plan_curv17by17 <- Qfit(dem_cropped, metrics = c("planc"), w = c(17, 17))
+     cat("Plan curv @17 ",  "\n")
+    #plan_curv49by49 <- Qfit(dem_cropped, metrics = c("planc"), w = c(49, 49))
+    #cat("Plan curv @49 ",  "\n")
     
+    # Calculate TPI at different scales
+    tpi_100m <- calculate_tpi(dem_cropped, scale = 100)
+     cat("TPI @100 ",  "\n")
+    tpi_200m <- calculate_tpi(dem_cropped, scale = 200)
+     cat("TPI @200 ",  "\n")
+   # tpi_500m <- calculate_tpi(dem_cropped, scale = 500)
+  #   cat("TPI @500 ",  "\n")
+
+    
+    # Define output stream raster file path
+    streams_output <- "./streams.tif"
+
+    # Set a threshold for stream extraction (e.g., 1000). Adjust as needed.
+    threshold <- 1000
+
+    # Run Extract Streams
+   wbt_extract_streams("./flow_accumulationdinf.tif", output = streams_output, threshold = threshold)
+    cat("Ext streams",  "\n")
+   streams <- rast("streams.tif")
+
+     # DTW
+    # Mask the DEM using the stream layer to keep elevations only at stream cells
+    stream_elevation <- mask(filledeelevation, streams)
+
+     cat("Stream elevation",  "\n")
+    # Use `terra::focal` with a larger window or use interpolation directly
+    # Fill NAs in `stream_elevation` by using distance-based interpolation
+
+    nearest_stream_elevation <- focal(stream_elevation, w = 9, fun = min, na.rm = TRUE)
+     cat("Stream  focal elevation",  "\n")
+
+    # Subtract interpolated stream elevation from DEM
+    depth_to_water <- filledeelevation - nearest_stream_elevation
+
+    # Mask the depth_to_water to get NA cells only
+    na_mask <- is.na(depth_to_water)
+
+    # Assuming depth_to_water is your raster with NA values
+    non_na_mask <- !is.na(depth_to_water)  # TRUE for non-NA cells
+
+    # Calculate the distance to the nearest non-NA cell
+    distance_to_valid <- distance(non_na_mask)
+   cat("Stream  distance",  "\n")  
+    # Interpolate NA values based on nearby cells
+    depth_to_water_filled <- focal(depth_to_water, w = 11, fun = mean, na.rm = TRUE)
+     cat("dtw filled",  "\n")  
+    # Smoothing using a mean filter
+    r_smoothed <- focal(depth_to_water, w = matrix(1, 3, 3) / 9, fun = mean, na.rm = TRUE)
+
+
+    # Replace Holes with Nearest Neighbor Values
+    #Use terra::app to replace NA with the nearest non-NA value.
+
+    r_filled_nn <- app(depth_to_water, fun = function(x) {
+      ifelse(is.na(x), mean(x, na.rm = TRUE), x)
+    })
+    cat("app filled",  "\n")  
+
+    # Crop the raster to the extent of the vector
+    cropped_raster_dtw <- crop(r_filled_nn, huc8_boundary)
+    # Mask the cropped raster to the vector's exact shape
+    masked_raster_dtw <- mask(cropped_raster_dtw, huc8_boundary)
+    cat("masked",  "\n")  
     # Combine DEM, slope, and aspect into one multi-layer raster
     combined_raster <- c(dem_cropped, slope,profile_curv,plan_curv,
-                         sca,twi,roughness,tpi,vrm)
+                         sca,roughness,tpi,vrm,twi,
+                     profile_curv9by9,profile_curv17by17,
+                     #profile_curv100by100,
+                     plan_curv9by9,plan_curv17by17,
+                     #plan_curv49by49,
+                     tpi_100m,tpi_200m,
+                     #tpi_500m,
+                     masked_raster_dtw)
+    
+     cat("combined",  "\n")  
 
+    #  names(combined_raster) <- c( "elevation",  "slope"         ,    "profc"        ,     "planc"  ,
+   #"flow_acc","twi", "roughness"      ,   "TPI"       ,        "vrm"  )
+      # removing
+   #  "profc_1000",
+   #   "planc_490",
+   #   "TPI_500" ,
     names(combined_raster) <- c( "elevation",  "slope"         ,    "profc"        ,     "planc"  ,
- "flow_acc","twi", "roughness"      ,   "TPI"       ,        "vrm"  )
-      
+ "flow_acc", "roughness"      ,   "TPI"       ,        "vrm" , "twi",
+ "profc_90","profc_170",
+ 
+ "planc_90","planc_170",
+
+ "TPI_100" ,"TPI_200" ,
+
+ "dtw")
+    huc8_name <- gsub("\\s+", "", huc8_name)
     # Save DEM as a GeoTIFF file
     file_name <- paste0(datapath,"/terr_stack", huc8_name, ".tif")
     writeRaster(combined_raster, file_name,  gdal=c("COMPRESS=LZW"),overwrite=TRUE)
     message(paste("DEM downloaded and saved for HUC8:", huc8_id," with ", huc8_name))
+    gc()  # Free up memory
   }, error = function(e) {
     message(paste("Error downloading DEM for HUC8:", huc8_id, " - ", e))
+    gc()  # Free up memory
   })
 }
 
 # Loop through all HUC8 regions in Washington and download DEMs
-for (i in 1:nrow(huc8_regions[1])) {
-#for (i in 1:1) {
+#for (i in 1:nrow(huc8_regions[1])) {
+for (i in 2:nrow(huc8_regions[1])) {
   huc8_boundary <- huc8_regions[i, ]
   huc8_id <- huc8_regions$huc8[i]
    huc8_name <- huc8_regions$name[i]
@@ -172,6 +302,7 @@ for (i in 1:nrow(huc8_regions[1])) {
 }
 ```
 
+
 ## Expected Outputs
 
 Input DEM files in the /data/WA_10m directory. Multi-layer GeoTIFF files with terrain attributes. Logs of any errors encountered during processing.
@@ -179,3 +310,5 @@ Input DEM files in the /data/WA_10m directory. Multi-layer GeoTIFF files with te
 ## Tips and Troubleshooting
 
 Ensure all packages are installed and up-to-date. Check file paths and permissions if data is not saving correctly. Review WhiteboxTools logs for specific tool errors.
+
+
